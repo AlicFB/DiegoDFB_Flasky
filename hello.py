@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from threading import Thread
 import requests
 from dotenv import load_dotenv
@@ -50,6 +51,16 @@ class User(db.Model):
         return '<User %r>' % self.username
 
 
+class SentEmail(db.Model):
+    __tablename__ = 'sent_emails'
+    id = db.Column(db.Integer, primary_key=True)
+    sender = db.Column(db.String(128))
+    recipients = db.Column(db.String(256))
+    subject = db.Column(db.String(128))
+    body = db.Column(db.Text)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+
 class NameForm(FlaskForm):
     name = StringField('Qual é o seu nome?', validators=[DataRequired()])
     send_to_teacher = BooleanField('Deseja enviar e-mail para flaskaulasweb@zohomail.com?')
@@ -58,7 +69,7 @@ class NameForm(FlaskForm):
 
 @app.shell_context_processor
 def make_shell_context():
-    return dict(db=db, User=User, Role=Role)
+    return dict(db=db, User=User, Role=Role, SentEmail=SentEmail)
 
 
 @app.errorhandler(404)
@@ -86,27 +97,40 @@ def send_async_email(app, payload):
             print(f"Exceção ao enviar e-mail: {e}")
 
 
-def send_email(to, subject, template, send_to_teacher=False, **kwargs):
+def send_email(to, subject, template, send_to_teacher=False, user=None, **kwargs):
     if not app.config.get('SENDGRID_API_KEY') or not app.config.get('FLASKY_ADMIN'):
         print("AVISO: SENDGRID_API_KEY ou FLASKY_ADMIN nao configurados no .env")
         return None
 
     try:
-        html_content = render_template(template + '.html', **kwargs)
+        html_content = render_template(template + '.html', user=user, **kwargs)
     except Exception as e:
         print(f"Erro ao renderizar modelo de e-mail {template}: {e}")
         return None
 
-    recipients = [{"email": to}]
-
+    recipients_list = [to]
     if send_to_teacher:
-        recipients.append({"email": "flaskaulasweb@zohomail.com"})
+        recipients_list.append("flaskaulasweb@zohomail.com")
 
+    recipients_str = ", ".join([f"'{email}'" for email in recipients_list])
+    full_subject = app.config['FLASKY_MAIL_SUBJECT_PREFIX'] + ' ' + subject
+    body_text = f"Novo usuário cadastrado: {user.username}" if user else ""
+
+    sent_record = SentEmail(
+        sender=user.username if user else "Sistema",
+        recipients=recipients_str,
+        subject=full_subject,
+        body=body_text
+    )
+    db.session.add(sent_record)
+    db.session.commit()
+
+    recipients_payload = [{"email": r} for r in recipients_list]
     payload = {
         "personalizations": [
             {
-                "to": recipients,
-                "subject": app.config['FLASKY_MAIL_SUBJECT_PREFIX'] + ' ' + subject
+                "to": recipients_payload,
+                "subject": full_subject
             }
         ],
         "from": {
@@ -140,7 +164,7 @@ def index():
             if app.config.get('FLASKY_ADMIN'):
                 send_email(
                     to=app.config['FLASKY_ADMIN'],
-                    subject='Novo Usuário Cadastrado',
+                    subject='Novo usuário',
                     template='mail/new_user',
                     send_to_teacher=form.send_to_teacher.data,
                     user=user
@@ -156,3 +180,9 @@ def index():
                            name=session.get('name'),
                            known=session.get('known', False),
                            users=users)
+
+
+@app.route('/emailsEnviados')
+def emails_enviados():
+    emails = SentEmail.query.order_by(SentEmail.timestamp.desc()).all()
+    return render_template('emailsEnviados.html', emails=emails)
